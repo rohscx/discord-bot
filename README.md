@@ -1,164 +1,150 @@
-# Environment Variables
+# 🔊 Lounge Bot
 
-Set the following environment variables:
+A lightweight Discord bot that notifies your server when someone joins a voice channel — so nobody misses out when the squad is hanging out.
+
+## What It Does
+
+When a member joins the **Lounge** voice channel, the bot posts a notification to a designated text channel with:
+
+- **Who joined** the voice channel
+- **Who's already there** — see the full list of current members
+- **What they're up to** — game activity, Spotify, streaming status
+
+### Spam Prevention
+
+If someone disconnects and rejoins within a configurable time window (default: 2 hours), the bot suppresses the notification to keep the text channel clean. No more notification spam from flaky connections.
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- A [Discord Bot Token](https://discord.com/developers/applications) with the following **Privileged Gateway Intents** enabled:
+  - Server Members Intent
+  - Presence Intent
+
+### 1. Clone the repo
 
 ```bash
-DISCORD_BOT_TOKEN=your_discord_bot_token_here
+git clone https://github.com/rohscx/discord-bot.git
+cd discord-bot
+```
+
+### 2. Set up environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your values:
+
+```bash
+DISCORD_BOT_TOKEN=your_bot_token_here
 TEXT_CHANNEL_ID=your_text_channel_id_here
-TIME_THRESHOLD=7200  # Adjust threshold as needed (in seconds)
+TIME_THRESHOLD=7200  # Spam suppression window in seconds (default: 2 hours)
 ```
 
-Copy `.env.example` to `.env` and fill in your actual values.
+> **How to get the Channel ID:** Enable Developer Mode in Discord (Settings → Advanced → Developer Mode), then right-click the text channel and select "Copy Channel ID".
 
----
+### 3. Run it
 
-# Synology AWS ECR Setup Guide
-
-## Step 1: Get the AWS ECR Authentication Token
-
-Run the following command on your local machine (with AWS CLI installed):
+**Option A: Python (venv)**
 
 ```bash
-aws ecr get-login-password --region <your-region>
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python lounge_bot.py
 ```
 
-For example:
+**Option B: Docker**
 
 ```bash
-aws ecr get-login-password --region us-east-1
+docker build -t lounge-bot .
+docker run -d --env-file .env --name lounge-bot lounge-bot
 ```
 
-The command will output a long token string. **Copy this token**—it will serve as the **password**.
+**Option C: systemd (Linux server)**
 
----
-
-## Step 2: Build and Push the Docker Image to AWS ECR
-
-### 1. Configure AWS CLI (on your local machine):
+A systemd service file and install script are provided in the `deploy/` directory for running the bot as a persistent background service:
 
 ```bash
-aws configure
+bash deploy/install.sh
 ```
-You’ll be prompted for:
-- **AWS Access Key ID**
-- **AWS Secret Access Key**
-- **Region** (e.g., `us-east-1`)
-- **Output format** (leave default or choose your preference)
 
----
+This will:
+- Create a Python virtual environment (if needed)
+- Install dependencies
+- Install and enable the systemd service
+- Start the bot
 
-### 2. Create an ECR Repository
+Manage the service with:
 
 ```bash
-aws ecr create-repository --repository-name discord-bot
+sudo systemctl status lounge-bot    # Check status
+sudo systemctl restart lounge-bot   # Restart
+sudo journalctl -u lounge-bot -f    # View live logs
 ```
 
----
+## Configuration
 
-### 3. Authenticate Docker to AWS ECR
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DISCORD_BOT_TOKEN` | ✅ | — | Your Discord bot token |
+| `TEXT_CHANNEL_ID` | ✅ | — | Channel ID where notifications are posted |
+| `TIME_THRESHOLD` | ❌ | `7200` | Seconds before a rejoin triggers a new notification |
 
-```bash
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <your-aws-account-id>.dkr.ecr.us-east-1.amazonaws.com
-```
-
----
-
-### 4. Build the Docker Image
-
-```bash
-docker buildx build --platform linux/amd64 -t <your-aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/discord-bot .
-```
-
----
-
-### 5. Push the Image to AWS ECR
-
-```bash
-docker push <your-aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/discord-bot:latest
-```
-
-Once the image is pushed, you can use the Synology NAS to pull and deploy the image as needed.
-
----
-
-## Step 3: Configure Synology NAS Docker Registry
-
-On your Synology NAS Docker settings:
-
-- **Registry Name:** Set it to something meaningful, like **AWS ECR**.
-- **Registry URL:** Use the correct format:
-
-  ```
-  https://<aws_account_id>.dkr.ecr.<region>.amazonaws.com
-  ```
-
-  **Example:**
-
-  ```
-  https://<your-aws-account-id>.dkr.ecr.us-east-1.amazonaws.com
-  ```
-
-- **Username:** Set it to **AWS** (required for AWS ECR).
-- **Password:** Paste the token you copied from **Step 1**.
-- **SSL:** Check **Trust SSL Self-Signed Certificate** if applicable, or leave unchecked if using a trusted certificate.
-
----
-
-## Step 4: Test the Connection
-
-Click **Apply**, then try pulling a container image from the AWS ECR using the Synology NAS Docker interface.
-
-**Example image URL:**
+## How It Works
 
 ```
-aws_account_id.dkr.ecr.<region>.amazonaws.com/your-repository:your-tag
+Member joins "Lounge" voice channel
+        │
+        ▼
+  Joined recently?  ──yes──▶  Suppress notification (log only)
+        │
+        no
+        │
+        ▼
+  Post notification to text channel:
+    • @here ping
+    • Member name
+    • Current channel members
+    • Activity/game status
 ```
 
----
+## Deployment Options
 
-# Docker Hub and Local Deployment on Synology NAS
-  
-## Build and Push Docker Image to Docker Hub
+The bot needs a persistent connection to Discord's gateway, so it must run on something that stays on 24/7.
 
-```bash
-docker buildx build --platform linux/amd64 -t <your-dockerhub-username>/discord-bot-image .
-docker push <your-dockerhub-username>/discord-bot-image
+| Platform | Works? | Notes |
+|----------|--------|-------|
+| Linux server / EC2 | ✅ | Use the systemd service in `deploy/` |
+| Synology NAS (Docker) | ✅ | See Docker instructions above |
+| Docker Hub | ✅ | Build and push with `docker buildx` |
+| AWS ECR + NAS | ✅ | Push to ECR, pull from NAS |
+| Google Cloud Run | ❌ | Idles and kills WebSocket connections |
+| AWS Lambda | ❌ | Same timeout/idle issues |
+
+## Project Structure
+
+```
+├── lounge_bot.py        # Main bot logic
+├── requirements.txt     # Python dependencies
+├── Dockerfile           # Container build
+├── .env.example         # Environment template
+├── deploy/
+│   ├── lounge-bot.service   # systemd unit file
+│   └── install.sh           # Automated install script
+└── README.md
 ```
 
-# Google Cloud Deployment (For Reference Only, Does Not Work Due to Cloud Run Timeouts and Idling)
+## Contributing
 
-## Build and Push Docker Image to Google Cloud
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feature/your-feature`)
+3. Commit your changes
+4. Push and open a PR
 
-```bash
-docker build -t discord-bot-image . &\
-docker buildx build --platform linux/amd64 -t discord-bot-image .
-```
+## License
 
-Tag and push the image:
-
-```bash
-docker tag discord-bot-image gcr.io/<your-gcp-project-id>/discord-bot-image &\
-docker push gcr.io/<your-gcp-project-id>/discord-bot-image
-```
-
-## Run Locally
-
-```bash
-docker run -e DISCORD_BOT_TOKEN='<Place_Token_here>' -p 8080:8080 discord-bot-image
-```
-
-## Deploy to Google Cloud Run
-
-```bash
-gcloud run deploy discord-bot-service \
-  --image gcr.io/<your-gcp-project-id>/discord-bot-image \
-  --platform managed \
-  --region us-east1 \
-  --no-allow-unauthenticated \
-  --memory 512Mi \
-  --set-env-vars DISCORD_BOT_TOKEN=<your_discord_bot_token> \
-  --timeout 300
-```
-
----
-
+See [LICENSE](LICENSE) for details.
