@@ -92,7 +92,26 @@ sudo journalctl -u lounge-bot -f    # View live logs
 |----------|----------|---------|-------------|
 | `DISCORD_BOT_TOKEN` | ✅ | — | Your Discord bot token |
 | `TEXT_CHANNEL_ID` | ✅ | — | Channel ID where notifications are posted |
+| `VOICE_CHANNEL_NAME` | ❌ | `Lounge` | Voice channel to monitor |
 | `TIME_THRESHOLD` | ❌ | `7200` | Seconds before a rejoin triggers a new notification |
+| `OFFICE_HOURS_ENABLED` | ❌ | `false` | Enable quiet hours (see below) |
+| `OFFICE_HOURS_START` | ❌ | `06:00` | Start of notification window (HH:MM) |
+| `OFFICE_HOURS_END` | ❌ | `22:30` | End of notification window (HH:MM) |
+| `OFFICE_HOURS_TZ` | ❌ | `US/Eastern` | Timezone for office hours (handles DST automatically) |
+
+### Office Hours
+
+When enabled, notifications sent **outside** the configured window will still be posted to the text channel but **without the `@here` ping**. This way late-night gaming sessions don't buzz everyone's phone, but the activity is still visible for anyone who checks the channel.
+
+```
+# Example: Only ping between 6 AM and 10:30 PM Eastern
+OFFICE_HOURS_ENABLED=true
+OFFICE_HOURS_START=06:00
+OFFICE_HOURS_END=22:30
+OFFICE_HOURS_TZ=US/Eastern
+```
+
+Overnight windows are also supported (e.g., `OFFICE_HOURS_START=22:00`, `OFFICE_HOURS_END=06:00` would ping during the late-night hours).
 
 ## How It Works
 
@@ -100,16 +119,23 @@ sudo journalctl -u lounge-bot -f    # View live logs
 Member joins "Lounge" voice channel
         │
         ▼
+  Actually in channel?  ──no──▶  Discard (stale gateway event)
+        │
+        yes
+        │
+        ▼
   Joined recently?  ──yes──▶  Suppress notification (log only)
         │
         no
         │
         ▼
-  Post notification to text channel:
-    • @here ping
-    • Member name
-    • Current channel members
-    • Activity/game status
+  Within office hours?
+    │           │
+   yes          no
+    │           │
+    ▼           ▼
+  Post with   Post WITHOUT
+  @here ping  @here ping
 ```
 
 ## Deployment Options
