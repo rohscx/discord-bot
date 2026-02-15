@@ -3,7 +3,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import discord
 from discord.ext import commands
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
+from zoneinfo import ZoneInfo
 
 # --- Logging Setup ---
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -56,6 +57,55 @@ except ValueError:
 
 VOICE_CHANNEL_NAME = os.environ.get('VOICE_CHANNEL_NAME', 'Lounge')
 
+# --- Office Hours Configuration ---
+# When enabled, notifications sent outside the configured window will omit
+# the @here ping so nobody gets buzzed at 2 AM. The notification still posts
+# for context — just silently.
+OFFICE_HOURS_ENABLED = os.environ.get('OFFICE_HOURS_ENABLED', 'false').lower() in ('true', '1', 'yes')
+OFFICE_HOURS_START_STR = os.environ.get('OFFICE_HOURS_START', '06:00')
+OFFICE_HOURS_END_STR = os.environ.get('OFFICE_HOURS_END', '22:30')
+OFFICE_HOURS_TZ_STR = os.environ.get('OFFICE_HOURS_TZ', 'US/Eastern')
+
+# Parse office hours config
+OFFICE_HOURS_START = None
+OFFICE_HOURS_END = None
+OFFICE_HOURS_TZ = None
+
+if OFFICE_HOURS_ENABLED:
+    try:
+        h, m = OFFICE_HOURS_START_STR.split(':')
+        OFFICE_HOURS_START = dt_time(int(h), int(m))
+        h, m = OFFICE_HOURS_END_STR.split(':')
+        OFFICE_HOURS_END = dt_time(int(h), int(m))
+        OFFICE_HOURS_TZ = ZoneInfo(OFFICE_HOURS_TZ_STR)
+        logger.info(
+            f"Office hours enabled: {OFFICE_HOURS_START_STR} – {OFFICE_HOURS_END_STR} "
+            f"({OFFICE_HOURS_TZ_STR}). Notifications outside this window will omit @here."
+        )
+    except (ValueError, KeyError) as e:
+        logger.error(f"Invalid office hours configuration: {e}. Disabling office hours.")
+        OFFICE_HOURS_ENABLED = False
+
+
+def is_within_office_hours():
+    """Check if the current time falls within the configured office hours window.
+
+    Handles normal ranges (e.g., 06:00–22:30) and overnight ranges (e.g., 22:00–06:00).
+    Returns True if office hours are disabled (all hours are 'active').
+    """
+    if not OFFICE_HOURS_ENABLED:
+        return True
+
+    now = datetime.now(OFFICE_HOURS_TZ).time()
+
+    if OFFICE_HOURS_START <= OFFICE_HOURS_END:
+        # Normal range: e.g., 06:00 – 22:30
+        return OFFICE_HOURS_START <= now <= OFFICE_HOURS_END
+    else:
+        # Overnight range: e.g., 22:00 – 06:00 (active late night through early morning)
+        return now >= OFFICE_HOURS_START or now <= OFFICE_HOURS_END
+
+
 # --- Bot Setup ---
 intents = discord.Intents.default()
 intents.voice_states = True
@@ -90,6 +140,10 @@ async def on_ready():
     logger.info(f"Monitoring voice channel: '{VOICE_CHANNEL_NAME}'")
     logger.info(f"Notifications channel ID: {text_channel_id}")
     logger.info(f"Spam threshold: {TIME_THRESHOLD}s")
+    if OFFICE_HOURS_ENABLED:
+        logger.info(f"Office hours: {OFFICE_HOURS_START_STR} – {OFFICE_HOURS_END_STR} ({OFFICE_HOURS_TZ_STR})")
+    else:
+        logger.info("Office hours: disabled (notifications ping @here at all times)")
     logger.info("Bot is ready and listening for voice state updates.")
 
 
@@ -166,10 +220,23 @@ async def on_voice_state_update(member, before, after):
     members_list = ', '.join(member_names)
     activity = get_member_activity(member)
 
-    logger.info(f"JOIN: {member.display_name} → '{VOICE_CHANNEL_NAME}' | Members: {members_list} | Activity: {activity}")
+    # Determine if we should ping @here based on office hours
+    within_hours = is_within_office_hours()
+
+    if within_hours:
+        ping = "@here\n"
+        logger.info(f"JOIN: {member.display_name} → '{VOICE_CHANNEL_NAME}' | Members: {members_list} | Activity: {activity}")
+    else:
+        ping = ""
+        local_time = datetime.now(OFFICE_HOURS_TZ).strftime('%I:%M %p %Z') if OFFICE_HOURS_TZ else "unknown"
+        logger.info(
+            f"JOIN (OFF-HOURS): {member.display_name} → '{VOICE_CHANNEL_NAME}' | "
+            f"Members: {members_list} | Activity: {activity} | "
+            f"Local time: {local_time} — @here suppressed"
+        )
 
     message = (
-        f"@here\n"
+        f"{ping}"
         f"🔊 **{member.display_name}** has joined **{after.channel.name}**.\n"
         f"👥 Current members in the channel: {members_list}\n"
         f"🎮 Status: {activity}"
@@ -179,7 +246,8 @@ async def on_voice_state_update(member, before, after):
     if text_channel:
         try:
             await text_channel.send(message)
-            logger.info(f"NOTIFY: Sent join notification for {member.display_name}")
+            notify_type = "NOTIFY" if within_hours else "NOTIFY (QUIET)"
+            logger.info(f"{notify_type}: Sent join notification for {member.display_name}")
         except Exception as e:
             logger.error(f"NOTIFY FAILED: Could not send message — {e}")
     else:
