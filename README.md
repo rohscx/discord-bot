@@ -57,14 +57,7 @@ pip install -r requirements.txt
 python lounge_bot.py
 ```
 
-**Option B: Docker**
-
-```bash
-docker build -t lounge-bot .
-docker run -d --env-file .env --name lounge-bot lounge-bot
-```
-
-**Option C: systemd (Linux server)**
+**Option B: systemd (Linux server)**
 
 A systemd service file and install script are provided in the `deploy/` directory for running the bot as a persistent background service:
 
@@ -92,7 +85,8 @@ sudo journalctl -u lounge-bot -f    # View live logs
 |----------|----------|---------|-------------|
 | `DISCORD_BOT_TOKEN` | ✅ | — | Your Discord bot token |
 | `TEXT_CHANNEL_ID` | ✅ | — | Channel ID where notifications are posted |
-| `VOICE_CHANNEL_NAME` | ❌ | `Lounge` | Voice channel to monitor |
+| `VOICE_CHANNEL_ID` | ❌ | — | Voice channel ID to monitor (preferred — immutable) |
+| `VOICE_CHANNEL_NAME` | ❌ | `Lounge` | Voice channel name fallback (used if ID not set) |
 | `TIME_THRESHOLD` | ❌ | `7200` | Seconds before a rejoin triggers a new notification |
 | `OFFICE_HOURS_ENABLED` | ❌ | `false` | Enable quiet hours (see below) |
 | `OFFICE_HOURS_START` | ❌ | `06:00` | Start of notification window (HH:MM) |
@@ -138,29 +132,20 @@ Member joins "Lounge" voice channel
   @here ping  @here ping
 ```
 
-## Deployment Options
+## Deployment
 
-The bot needs a persistent connection to Discord's gateway, so it must run on something that stays on 24/7.
-
-| Platform | Works? | Notes |
-|----------|--------|-------|
-| Linux server / EC2 | ✅ | Use the systemd service in `deploy/` |
-| Synology NAS (Docker) | ✅ | See Docker instructions above |
-| Docker Hub | ✅ | Build and push with `docker buildx` |
-| AWS ECR + NAS | ✅ | Push to ECR, pull from NAS |
-| Google Cloud Run | ❌ | Idles and kills WebSocket connections |
-| AWS Lambda | ❌ | Same timeout/idle issues |
+The bot needs a persistent connection to Discord's gateway, so it must run on something that stays on 24/7. Use the systemd service in `deploy/` for Linux servers (EC2, etc.). Serverless platforms (Cloud Run, Lambda) are not compatible — they idle and kill WebSocket connections.
 
 ## Project Structure
 
 ```
 ├── lounge_bot.py        # Main bot logic
 ├── requirements.txt     # Python dependencies
-├── Dockerfile           # Container build
 ├── .env.example         # Environment template
 ├── deploy/
 │   ├── lounge-bot.service   # systemd unit file
 │   └── install.sh           # Automated install script
+├── tests/               # Test suite
 └── README.md
 ```
 
