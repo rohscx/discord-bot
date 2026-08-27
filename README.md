@@ -9,6 +9,11 @@ When a member joins the **Lounge** voice channel, the bot posts a notification t
 - **Who joined** the voice channel
 - **Who's already there** — see the full list of current members
 - **What they're up to** — game activity, Spotify, streaming status
+- **Where they've been** — playful announcements can reference a game observed
+  in the last 24 hours or their most-played game from the last 30 days
+
+Game history is observed from Discord presence while the bot is online. It is
+not authoritative playtime and never treats Spotify or custom statuses as games.
 
 ### Spam Prevention
 
@@ -92,6 +97,39 @@ sudo journalctl -u lounge-bot -f    # View live logs
 | `OFFICE_HOURS_START` | ❌ | `06:00` | Start of notification window (HH:MM) |
 | `OFFICE_HOURS_END` | ❌ | `22:30` | End of notification window (HH:MM) |
 | `OFFICE_HOURS_TZ` | ❌ | `US/Eastern` | Timezone for office hours (handles DST automatically) |
+| `GAME_HISTORY_ENABLED` | ❌ | `true` | Persist observed game sessions and personalize announcements |
+| `GAME_HISTORY_TABLE` | ❌ | `openclaw-discord-bot-state` | Existing DynamoDB table with `pk` and `sk` string keys |
+| `AWS_REGION` | ❌ | `us-east-1` | DynamoDB region; the EC2 instance role supplies credentials |
+| `GAME_TRACKING_EXCLUDED_MEMBER_IDS` | ❌ | — | Comma-separated member IDs that receive generic announcements and are never stored |
+
+## DynamoDB game history
+
+The bot uses the existing `openclaw-discord-bot-state` table. It performs only
+item operations and bounded `Query` calls—never `Scan`, table creation, or table
+mutation.
+
+Member data uses this single-table layout:
+
+```text
+pk = guild#<guild_id>#member#<member_id>
+sk = state
+sk = announcement
+sk = session#<YYYY-MM-DDTHH:mm:ss.SSSZ>#<game-key>
+```
+
+Session timestamps are fixed-width UTC RFC 3339 so lexical and chronological
+sort order are identical. The timestamp intentionally precedes the game key:
+recent history is the primary access pattern, while per-game totals are computed
+locally over a bounded 30-day query. Every session has an `expires_at` epoch value
+90 days after it ends. The application also ignores logically expired sessions
+because DynamoDB TTL deletion is asynchronous.
+
+Writes occur only when a member starts, changes, or stops a game. Presence is
+reconciled gently after startup at no more than four members per second. AWS SDK
+standard retries handle transient throttling; any DynamoDB failure falls back to
+the live Discord activity and does not suppress the voice-join notification.
+Observed sessions are capped at 24 hours so downtime or a stale presence cannot
+turn into a fictitious multi-day gaming marathon.
 
 ### Office Hours
 
@@ -139,7 +177,8 @@ The bot needs a persistent connection to Discord's gateway, so it must run on so
 ## Project Structure
 
 ```
-├── lounge_bot.py        # Main bot logic
+├── lounge_bot.py        # Discord event handlers
+├── game_history.py      # DynamoDB persistence and announcement templates
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Environment template
 ├── deploy/

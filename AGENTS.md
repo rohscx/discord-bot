@@ -59,3 +59,21 @@
 **Why:** Console output goes to journald via systemd, which is great for `journalctl` but has limited retention. The rotating file handler captures DEBUG-level detail for post-incident analysis without unbounded disk growth (5MB × 3 backups = 20MB max).
 
 **Structured prefixes:** `JOIN`, `LEAVE`, `SUPPRESS`, `STALE`, `NOTIFY` — designed for `grep` workflows.
+
+## DynamoDB Game History
+
+**Decision (2026-08-27):** Use the existing `openclaw-discord-bot-state` table;
+do not create a table or GSI. Member data uses
+`pk=guild#<guild_id>#member#<member_id>` with `state`, `announcement`, and
+`session#<YYYY-MM-DDTHH:mm:ss.SSSZ>#<game-key>` sort keys.
+
+The timestamp format is a fixed-width UTC RFC 3339 requirement because lexical
+sort order must equal chronological order. Timestamp-first deliberately favors
+bounded recent-history queries over querying one game across arbitrary dates.
+
+Every session requires `ended_at` and a numeric `expires_at` 90 days later.
+DynamoDB TTL is asynchronous, so application reads must also reject logically
+expired records. Use `Query`, never `Scan`; 5 RCU/WCU is shared table capacity.
+Writes occur on game transitions only, startup reconciliation is rate-limited,
+and AWS failures must degrade to generic/live announcements without blocking the
+Discord notification.

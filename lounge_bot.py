@@ -1,11 +1,16 @@
 import os
 import sys
+import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+import boto3
+from botocore.config import Config
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
+
+from game_history import DynamoGameHistory, context_status_line
 
 # --- Logging Setup ---
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -67,6 +72,35 @@ if voice_channel_id_str:
         sys.exit(1)
 else:
     voice_channel_id = None
+
+# --- Game History Configuration ---
+GAME_HISTORY_ENABLED = os.environ.get('GAME_HISTORY_ENABLED', 'true').lower() in ('true', '1', 'yes')
+GAME_HISTORY_TABLE = os.environ.get('GAME_HISTORY_TABLE', 'openclaw-discord-bot-state')
+AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+
+excluded_ids_str = os.environ.get('GAME_TRACKING_EXCLUDED_MEMBER_IDS', '')
+try:
+    GAME_TRACKING_EXCLUDED_MEMBER_IDS = {
+        int(value.strip()) for value in excluded_ids_str.split(',') if value.strip()
+    }
+except ValueError:
+    logger.error("GAME_TRACKING_EXCLUDED_MEMBER_IDS must be a comma-separated list of integers.")
+    sys.exit(1)
+
+game_history = None
+if GAME_HISTORY_ENABLED:
+    try:
+        dynamodb = boto3.resource(
+            'dynamodb',
+            region_name=AWS_REGION,
+            config=Config(retries={'mode': 'standard', 'max_attempts': 5}),
+        )
+        game_history = DynamoGameHistory(
+            dynamodb.Table(GAME_HISTORY_TABLE),
+            excluded_member_ids=GAME_TRACKING_EXCLUDED_MEMBER_IDS,
+        )
+    except Exception as exc:
+        logger.warning("Game history initialization failed; using live activity only: %s", exc)
 
 # --- Office Hours Configuration ---
 # When enabled, notifications sent outside the configured window will omit
@@ -145,6 +179,45 @@ def get_member_activity(member):
     return "No activity"
 
 
+def get_member_game(member):
+    """Extract only trackable game activity; ignore Spotify and custom statuses."""
+    if member.activities:
+        for act in member.activities:
+            if isinstance(act, discord.Game):
+                return act.name
+            if isinstance(act, discord.Streaming) and act.game:
+                return act.game
+    return None
+
+
+async def reconcile_game_history():
+    """Reconcile persisted state against Discord presence without bursting DynamoDB."""
+    if not game_history:
+        return
+    logger.info("GAME HISTORY: Starting presence reconciliation across %d guild(s).", len(bot.guilds))
+    reconciled = 0
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot or game_history.is_excluded(member.id):
+                continue
+            try:
+                await asyncio.to_thread(
+                    game_history.record_transition,
+                    guild.id,
+                    member.id,
+                    get_member_game(member),
+                )
+                reconciled += 1
+            except Exception as exc:
+                logger.warning(
+                    "GAME HISTORY: Reconciliation failed for member %s: %s",
+                    member.id,
+                    exc,
+                )
+            await asyncio.sleep(0.25)
+    logger.info("GAME HISTORY: Reconciled %d member presence record(s).", reconciled)
+
+
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -158,10 +231,23 @@ async def on_ready():
         logger.info(f"Office hours: {OFFICE_HOURS_START_STR} – {OFFICE_HOURS_END_STR} ({OFFICE_HOURS_TZ_STR})")
     else:
         logger.info("Office hours: disabled (notifications ping @here at all times)")
+    if game_history:
+        logger.info(
+            "Game history: DynamoDB table %s in %s (%d member opt-out(s))",
+            GAME_HISTORY_TABLE,
+            AWS_REGION,
+            len(GAME_TRACKING_EXCLUDED_MEMBER_IDS),
+        )
+        global _reconcile_task
+        if _reconcile_task is None or _reconcile_task.done():
+            _reconcile_task = asyncio.create_task(reconcile_game_history())
+    else:
+        logger.info("Game history: disabled")
     logger.info("Bot is ready and listening for voice state updates.")
 
 
 _resume_grace_until = None  # suppress notifications briefly after resume
+_reconcile_task = None
 
 @bot.event
 async def on_resumed():
@@ -176,6 +262,32 @@ async def on_resumed():
 async def on_disconnect():
     """Log disconnections for debugging."""
     logger.warning("Bot disconnected from Discord gateway.")
+
+
+@bot.event
+async def on_presence_update(before, after):
+    """Persist observed game sessions only when the trackable game changes."""
+    if not game_history or after.bot or game_history.is_excluded(after.id):
+        return
+    previous_game = get_member_game(before)
+    current_game = get_member_game(after)
+    if previous_game == current_game:
+        return
+    try:
+        await asyncio.to_thread(
+            game_history.record_transition,
+            after.guild.id,
+            after.id,
+            current_game,
+        )
+        logger.info(
+            "GAME TRANSITION: %s | %s → %s",
+            after.display_name,
+            previous_game or "none",
+            current_game or "none",
+        )
+    except Exception as exc:
+        logger.warning("GAME HISTORY: Transition write failed for %s: %s", after.id, exc)
 
 
 def _is_target_channel(channel):
@@ -257,6 +369,26 @@ async def on_voice_state_update(member, before, after):
     member_names = [m.display_name for m in actual_members]
     members_list = ', '.join(member_names)
     activity = get_member_activity(member)
+    current_game = get_member_game(member)
+
+    headline = f"🔊 **{member.display_name}** has joined **{after.channel.name}**."
+    context = {"kind": "generic", "game": None}
+    if game_history:
+        try:
+            headline, context = await asyncio.to_thread(
+                game_history.announcement,
+                member.guild.id,
+                member.id,
+                member.display_name,
+                after.channel.name,
+                current_game,
+            )
+        except Exception as exc:
+            logger.warning(
+                "GAME HISTORY: Announcement lookup failed for %s; using live fallback: %s",
+                member.id,
+                exc,
+            )
 
     # Determine if we should ping @here based on office hours
     within_hours = is_within_office_hours()
@@ -275,9 +407,9 @@ async def on_voice_state_update(member, before, after):
 
     message = (
         f"{ping}"
-        f"🔊 **{member.display_name}** has joined **{after.channel.name}**.\n"
+        f"{headline}\n"
         f"👥 Current members in the channel: {members_list}\n"
-        f"🎮 Status: {activity}"
+        f"{context_status_line(context, activity)}"
     )
 
     text_channel = bot.get_channel(text_channel_id)
