@@ -1,10 +1,36 @@
 # Private presence bridge
 
-Opt-in bridge for the assistant to read a single member's current Discord game,
-without a network listener, new Discord messages, tokens, or activity history.
-The existing Discord Gateway presence intent must be enabled.
+Opt-in local snapshots let the assistant read current Discord presence without a
+network listener, new Discord messages, credentials, or activity history.
+Discord Gateway member and presence intents must be enabled.
 
-Deployment environment:
+## All cached members
+
+Set the following in the bot deployment environment and restart lounge-bot:
+
+```
+PRESENCE_MEMBERS_SNAPSHOT_PATH=/home/ec2-user/.openclaw/workspace/data/discord-presence/members.json
+```
+
+Every 30 seconds the bot exports members cached across all its available guilds,
+excluding GAME_TRACKING_EXCLUDED_MEMBER_IDS. Each member includes guild/member ID,
+username, display name, presence status, and playing activity names only.
+Custom statuses, listening titles, and streaming URLs are not exported.
+Unavailable guilds are omitted and listed separately. Members shared by multiple
+guilds retain one record per guild; ambiguous names return every exact match.
+
+Read all members, or filter by exact case-insensitive name or member ID:
+
+```
+python3 /home/ec2-user/.openclaw/workspace/discord-bot-release/presence_snapshot.py /home/ec2-user/.openclaw/workspace/data/discord-presence/members.json
+python3 /home/ec2-user/.openclaw/workspace/discord-bot-release/presence_snapshot.py /home/ec2-user/.openclaw/workspace/data/discord-presence/members.json --member Merda
+```
+
+Optional `--guild GUILD_ID` restricts results to one server.
+
+## Legacy single-member feed
+
+These settings remain supported independently, preserving existing consumers:
 
 ```
 PRESENCE_SNAPSHOT_PATH=/home/ec2-user/.openclaw/workspace/data/discord-presence/erou.json
@@ -12,26 +38,20 @@ PRESENCE_MEMBER_ID=591452415266521089
 PRESENCE_GUILD_ID=1209211111446937670
 ```
 
-The bot publishes every 30 seconds from its live cache. All three settings are
-required; default installations do not export anything. Member tracking opt-outs
-are respected. Each atomic snapshot is mode 0600 and includes connection state,
-cache-check timestamp, presence status and playing activity names only.
-No custom statuses, listening titles, streaming URLs or other members are exported.
+## Freshness and privacy
 
-Assistant read command after deployment:
+Default installations export nothing. Atomic snapshots retain mode 0600 and
+replace rather than append history. Readers reject snapshots older than 90 seconds,
+disconnected snapshots, missing members, and malformed files. A disconnect may
+leave the last snapshot readable until the next 30-second sample or freshness
+expiry. Timestamps represent cache checks, not newly received Discord events.
 
-```
-python3 /home/ec2-user/.openclaw/workspace/discord-bot-release/presence_snapshot.py /home/ec2-user/.openclaw/workspace/data/discord-presence/erou.json
-```
+An empty activities array means Discord reports no playing activity, not proof
+the member is not playing. Discord invisible users appear offline; the feed
+cannot distinguish them. Cached members are not a guarantee of complete server
+membership or fresh per-member presence.
 
-The reader rejects snapshots older than 90 seconds, disconnected snapshots,
-missing members and malformed files. Available with an empty activities array means
-Discord reports no playing activity, not proof the person is not playing.
-A disconnected bot can leave a last snapshot readable until its freshness limit;
-the heartbeat samples connected state every 30 seconds. Timestamps reflect cache
-checks, not necessarily a newly received Discord event.
-
-Merge through the normal PR workflow, deploy the reviewed revision, configure the
-three environment settings and restart lounge-bot. Read the snapshot to prove the
-live connection; do not claim success based only on unit tests. Rollback: unset
-PRESENCE_SNAPSHOT_PATH and restart. Delete the snapshot if disabling permanently.
+Normal changes use a branch and PR, with Erou merging. Authorized local deployment
+can precede merge. Verify the live snapshot after restart, not only unit tests.
+Rollback: restore previous code and environment and restart lounge-bot, or unset
+the relevant snapshot setting and remove the disabled snapshot.
