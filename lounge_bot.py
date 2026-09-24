@@ -6,7 +6,8 @@ from logging.handlers import RotatingFileHandler
 import boto3
 from botocore.config import Config
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+from presence_snapshot import write_snapshot
 from datetime import datetime, timezone, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -160,6 +161,26 @@ intents.message_content = False
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Opt-in private snapshot: one explicitly selected member in one guild.
+PRESENCE_SNAPSHOT_PATH = os.environ.get("PRESENCE_SNAPSHOT_PATH", "")
+PRESENCE_MEMBER_ID = int(os.environ.get("PRESENCE_MEMBER_ID", "0"))
+PRESENCE_GUILD_ID = int(os.environ.get("PRESENCE_GUILD_ID", "0"))
+
+
+@tasks.loop(seconds=30)
+async def publish_presence_snapshot():
+    if not PRESENCE_SNAPSHOT_PATH or not PRESENCE_MEMBER_ID or not PRESENCE_GUILD_ID:
+        return
+    try:
+        guild = bot.get_guild(PRESENCE_GUILD_ID)
+        await asyncio.to_thread(
+            write_snapshot, PRESENCE_SNAPSHOT_PATH, guild, PRESENCE_MEMBER_ID,
+            bot.is_ready(), PRESENCE_MEMBER_ID in GAME_TRACKING_EXCLUDED_MEMBER_IDS,
+        )
+    except Exception:
+        logger.exception("Private presence snapshot write failed")
+
+
 # Dictionary to track the last join time of members
 member_join_times = {}
 
@@ -220,6 +241,8 @@ async def reconcile_game_history():
 
 @bot.event
 async def on_ready():
+    if PRESENCE_SNAPSHOT_PATH and not publish_presence_snapshot.is_running():
+        publish_presence_snapshot.start()
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     if voice_channel_id:
         logger.info(f"Monitoring voice channel ID: {voice_channel_id}")
