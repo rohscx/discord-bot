@@ -1,10 +1,17 @@
 import os
+import sys
+import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+import boto3
+from botocore.config import Config
 import discord
-from discord.ext import commands
-from datetime import datetime, timezone, time as dt_time
+from discord.ext import commands, tasks
+from presence_snapshot import write_snapshot
+from datetime import datetime, timezone, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
+
+from game_history import DynamoGameHistory, context_status_line
 
 # --- Logging Setup ---
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -36,26 +43,65 @@ logger.addHandler(file_handler)
 TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 if not TOKEN:
     logger.error("DISCORD_BOT_TOKEN environment variable not set.")
-    exit(1)
+    sys.exit(1)
 
 text_channel_id_str = os.environ.get('TEXT_CHANNEL_ID')
 if not text_channel_id_str:
     logger.error("TEXT_CHANNEL_ID environment variable not set.")
-    exit(1)
+    sys.exit(1)
 try:
     text_channel_id = int(text_channel_id_str)
 except ValueError:
     logger.error("TEXT_CHANNEL_ID environment variable must be an integer.")
-    exit(1)
+    sys.exit(1)
 
 time_threshold_str = os.environ.get('TIME_THRESHOLD', '7200')
 try:
     TIME_THRESHOLD = int(time_threshold_str)
 except ValueError:
     logger.error("TIME_THRESHOLD environment variable must be an integer.")
-    exit(1)
+    sys.exit(1)
 
 VOICE_CHANNEL_NAME = os.environ.get('VOICE_CHANNEL_NAME', 'Lounge')
+
+voice_channel_id_str = os.environ.get('VOICE_CHANNEL_ID')
+if voice_channel_id_str:
+    try:
+        voice_channel_id = int(voice_channel_id_str)
+    except ValueError:
+        logger.error("VOICE_CHANNEL_ID environment variable must be an integer.")
+        sys.exit(1)
+else:
+    voice_channel_id = None
+
+# --- Game History Configuration ---
+GAME_HISTORY_ENABLED = os.environ.get('GAME_HISTORY_ENABLED', 'true').lower() in ('true', '1', 'yes')
+GAME_HISTORY_TABLE = os.environ.get('GAME_HISTORY_TABLE', 'openclaw-discord-bot-state')
+AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+
+excluded_ids_str = os.environ.get('GAME_TRACKING_EXCLUDED_MEMBER_IDS', '')
+try:
+    GAME_TRACKING_EXCLUDED_MEMBER_IDS = {
+        int(value.strip()) for value in excluded_ids_str.split(',') if value.strip()
+    }
+except ValueError:
+    logger.error("GAME_TRACKING_EXCLUDED_MEMBER_IDS must be a comma-separated list of integers.")
+    sys.exit(1)
+
+game_history = None
+if GAME_HISTORY_ENABLED:
+    try:
+        dynamodb = boto3.resource(
+            'dynamodb',
+            region_name=AWS_REGION,
+            config=Config(retries={'mode': 'standard', 'max_attempts': 5}),
+        )
+        game_history = DynamoGameHistory(
+            dynamodb.Table(GAME_HISTORY_TABLE),
+            excluded_member_ids=GAME_TRACKING_EXCLUDED_MEMBER_IDS,
+        )
+    except Exception as exc:
+        logger.warning("Game history initialization failed; using live activity only: %s", exc)
 
 # --- Office Hours Configuration ---
 # When enabled, notifications sent outside the configured window will omit
@@ -115,6 +161,26 @@ intents.message_content = False
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Opt-in private snapshot: one explicitly selected member in one guild.
+PRESENCE_SNAPSHOT_PATH = os.environ.get("PRESENCE_SNAPSHOT_PATH", "")
+PRESENCE_MEMBER_ID = int(os.environ.get("PRESENCE_MEMBER_ID", "0"))
+PRESENCE_GUILD_ID = int(os.environ.get("PRESENCE_GUILD_ID", "0"))
+
+
+@tasks.loop(seconds=30)
+async def publish_presence_snapshot():
+    if not PRESENCE_SNAPSHOT_PATH or not PRESENCE_MEMBER_ID or not PRESENCE_GUILD_ID:
+        return
+    try:
+        guild = bot.get_guild(PRESENCE_GUILD_ID)
+        await asyncio.to_thread(
+            write_snapshot, PRESENCE_SNAPSHOT_PATH, guild, PRESENCE_MEMBER_ID,
+            bot.is_ready(), PRESENCE_MEMBER_ID in GAME_TRACKING_EXCLUDED_MEMBER_IDS,
+        )
+    except Exception:
+        logger.exception("Private presence snapshot write failed")
+
+
 # Dictionary to track the last join time of members
 member_join_times = {}
 
@@ -134,24 +200,85 @@ def get_member_activity(member):
     return "No activity"
 
 
+def get_member_game(member):
+    """Extract only trackable game activity; ignore Spotify and custom statuses."""
+    if member.activities:
+        for act in member.activities:
+            if isinstance(act, discord.Game):
+                return act.name
+            if isinstance(act, discord.Streaming) and act.game:
+                return act.game
+    return None
+
+
+async def reconcile_game_history():
+    """Reconcile persisted state against Discord presence without bursting DynamoDB."""
+    if not game_history:
+        return
+    logger.info("GAME HISTORY: Starting presence reconciliation across %d guild(s).", len(bot.guilds))
+    reconciled = 0
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot or game_history.is_excluded(member.id):
+                continue
+            try:
+                await asyncio.to_thread(
+                    game_history.record_transition,
+                    guild.id,
+                    member.id,
+                    get_member_game(member),
+                )
+                reconciled += 1
+            except Exception as exc:
+                logger.warning(
+                    "GAME HISTORY: Reconciliation failed for member %s: %s",
+                    member.id,
+                    exc,
+                )
+            await asyncio.sleep(0.25)
+    logger.info("GAME HISTORY: Reconciled %d member presence record(s).", reconciled)
+
+
 @bot.event
 async def on_ready():
+    if PRESENCE_SNAPSHOT_PATH and not publish_presence_snapshot.is_running():
+        publish_presence_snapshot.start()
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    logger.info(f"Monitoring voice channel: '{VOICE_CHANNEL_NAME}'")
+    if voice_channel_id:
+        logger.info(f"Monitoring voice channel ID: {voice_channel_id}")
+    else:
+        logger.info(f"Monitoring voice channel by name: '{VOICE_CHANNEL_NAME}'")
     logger.info(f"Notifications channel ID: {text_channel_id}")
     logger.info(f"Spam threshold: {TIME_THRESHOLD}s")
     if OFFICE_HOURS_ENABLED:
         logger.info(f"Office hours: {OFFICE_HOURS_START_STR} – {OFFICE_HOURS_END_STR} ({OFFICE_HOURS_TZ_STR})")
     else:
         logger.info("Office hours: disabled (notifications ping @here at all times)")
+    if game_history:
+        logger.info(
+            "Game history: DynamoDB table %s in %s (%d member opt-out(s))",
+            GAME_HISTORY_TABLE,
+            AWS_REGION,
+            len(GAME_TRACKING_EXCLUDED_MEMBER_IDS),
+        )
+        global _reconcile_task
+        if _reconcile_task is None or _reconcile_task.done():
+            _reconcile_task = asyncio.create_task(reconcile_game_history())
+    else:
+        logger.info("Game history: disabled")
     logger.info("Bot is ready and listening for voice state updates.")
 
 
+_resume_grace_until = None  # suppress notifications briefly after resume
+_reconcile_task = None
+
 @bot.event
 async def on_resumed():
-    """Handle gateway reconnects — clear stale join times to prevent phantom notifications."""
-    logger.warning("Gateway session resumed. Clearing stale join time cache.")
-    member_join_times.clear()
+    """Handle gateway reconnects — keep cooldown cache intact, rely on membership check for stale events."""
+    global _resume_grace_until
+    logger.warning("Gateway session resumed. Cooldown cache preserved (%d entries).", len(member_join_times))
+    _resume_grace_until = datetime.now(timezone.utc) + timedelta(seconds=10)
+    logger.info("Resume grace period: suppressing join notifications for 10s.")
 
 
 @bot.event
@@ -161,16 +288,49 @@ async def on_disconnect():
 
 
 @bot.event
+async def on_presence_update(before, after):
+    """Persist observed game sessions only when the trackable game changes."""
+    if not game_history or after.bot or game_history.is_excluded(after.id):
+        return
+    previous_game = get_member_game(before)
+    current_game = get_member_game(after)
+    if previous_game == current_game:
+        return
+    try:
+        await asyncio.to_thread(
+            game_history.record_transition,
+            after.guild.id,
+            after.id,
+            current_game,
+        )
+        logger.info(
+            "GAME TRANSITION: %s | %s → %s",
+            after.display_name,
+            previous_game or "none",
+            current_game or "none",
+        )
+    except Exception as exc:
+        logger.warning("GAME HISTORY: Transition write failed for %s: %s", after.id, exc)
+
+
+def _is_target_channel(channel):
+    """Check if a channel matches the configured target (by ID if set, otherwise by name)."""
+    if channel is None:
+        return False
+    if voice_channel_id:
+        return channel.id == voice_channel_id
+    return channel.name == VOICE_CHANNEL_NAME
+
+
+@bot.event
 async def on_voice_state_update(member, before, after):
     joined_target = (
-        after.channel is not None
-        and after.channel.name == VOICE_CHANNEL_NAME
+        _is_target_channel(after.channel)
         and (before.channel is None or before.channel.id != after.channel.id)
     )
 
     left_target = (
-        before.channel is not None
-        and before.channel.name == VOICE_CHANNEL_NAME
+        _is_target_channel(before.channel)
         and (after.channel is None or after.channel.id != before.channel.id)
     )
 
@@ -197,6 +357,13 @@ async def on_voice_state_update(member, before, after):
         )
         return
 
+    # Resume grace period — suppress phantom joins after gateway reconnect
+    if _resume_grace_until and datetime.now(timezone.utc) < _resume_grace_until:
+        logger.info(
+            f"RESUME-SUPPRESSED: {member.display_name} join during post-resume grace period. Skipping."
+        )
+        return
+
     # Spam suppression — check if they joined recently
     current_time = datetime.now(timezone.utc)
     member_id = member.id
@@ -212,13 +379,39 @@ async def on_voice_state_update(member, before, after):
             )
             return
 
-    # Update the last join time
+    # Update the last join time and prune expired entries
     member_join_times[member_id] = current_time
+    stale_ids = [k for k, v in member_join_times.items()
+                 if (current_time - v).total_seconds() > TIME_THRESHOLD]
+    for stale_id in stale_ids:
+        del member_join_times[stale_id]
+    if stale_ids:
+        logger.debug(f"PRUNE: Removed {len(stale_ids)} expired cooldown entries.")
 
     # Build the notification
     member_names = [m.display_name for m in actual_members]
     members_list = ', '.join(member_names)
     activity = get_member_activity(member)
+    current_game = get_member_game(member)
+
+    headline = f"🔊 **{member.display_name}** has joined **{after.channel.name}**."
+    context = {"kind": "generic", "game": None}
+    if game_history:
+        try:
+            headline, context = await asyncio.to_thread(
+                game_history.announcement,
+                member.guild.id,
+                member.id,
+                member.display_name,
+                after.channel.name,
+                current_game,
+            )
+        except Exception as exc:
+            logger.warning(
+                "GAME HISTORY: Announcement lookup failed for %s; using live fallback: %s",
+                member.id,
+                exc,
+            )
 
     # Determine if we should ping @here based on office hours
     within_hours = is_within_office_hours()
@@ -237,9 +430,9 @@ async def on_voice_state_update(member, before, after):
 
     message = (
         f"{ping}"
-        f"🔊 **{member.display_name}** has joined **{after.channel.name}**.\n"
+        f"{headline}\n"
         f"👥 Current members in the channel: {members_list}\n"
-        f"🎮 Status: {activity}"
+        f"{context_status_line(context, activity)}"
     )
 
     text_channel = bot.get_channel(text_channel_id)
